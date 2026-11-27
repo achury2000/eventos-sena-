@@ -1,0 +1,10 @@
+# Tasks
+
+## 1. Listado paginado con buscador en el panel admin
+
+- [x] 1.1 Adaptar `src/app/admin/eventos/[id]/inscripciones/page.tsx` para recibir `searchParams: Promise<{ [key: string]: string | string[] | undefined }>` (Next 16) y derivar `q` (trim, máx. 100 caracteres) y `pagina` (entero ≥ 1, no numérico → 1) — verificar que `npm run lint` y `npx tsc --noEmit` no reportan errores.
+- [x] 1.2 Construir el filtro `where` de búsqueda (OR sobre `correo` de la inscripción y nombre/documento del titular vía `asistentes: { some: { esTitular: true, ... } }`) y compartirlo entre `count` y `findMany`, con `orderBy: { fechaInscripcion: "desc" }`, `skip`/`take` con `PAGINA_TAMANO = 20` y `totalPaginas = max(1, ceil(total / PAGINA_TAMANO))` — verificar que el total mostrado refleja la búsqueda activa.
+- [x] 1.3 Renderizar el formulario de búsqueda (`<form method="GET">`) y los controles de paginación (enlaces Anterior/Siguiente con `{ query: { q, pagina } }` e indicador "página X de Y") — verificar en navegador que enviar el formulario navega a `?q=...` y que la búsqueda se preserva al cambiar de página.
+- [x] 1.4 Mostrar estados vacíos diferenciados (evento sin inscripciones vs. búsqueda sin coincidencias) y el contador de rango "mostrando X–Y de Z" — verificar en navegador con un evento sin inscripciones y con una búsqueda sin resultados.
+- [x] 1.5 Ajustar `pagina` fuera de rango (p.ej. `?pagina=99`) a la última página válida, nunca mostrando una página vacía — verificar en navegador.
+- [x] 1.6 Verificación final de extremo a extremo con sesión de Administrador: búsqueda por nombre, por documento y por correo, búsqueda sin resultados, navegación de páginas completa, y regresión de la columna "Ver firma" y del botón de cancelación por fila — además `npm run lint` y `npx tsc --noEmit` sin errores.

@@ -1,0 +1,16 @@
+# Tasks
+
+## 1. Dependencia y datos del tablero
+
+- [x] 1.1 Instalar `recharts@3.10.1 --save-exact` y verificar que `package.json` la fija exacta y `npm ls recharts` la reporta instalada
+- [x] 1.2 En `src/lib/operador/tablero.ts`: cambiar el `groupBy` de registros a `by: ["checkpointId", "metodo"]` y derivar `registros` (auto + manual, idéntico al valor actual) y `manuales`; añadir la cobertura por evento (`groupBy` por `asistenteId` + `findMany` de `Asistente` para mapear `eventoId`, contando en el cliente) manteniendo un número constante de consultas sin N+1; añadir `asistentesRegistrados` a `EventoTablero` y `manuales` a `CheckpointTablero`. Verificar con `npx tsc --noEmit`
+
+## 2. Gráficos en el panel del Operador
+
+- [x] 2.1 Crear `src/app/operador/graficos-panel.tsx` (cliente) con `GraficosEvento({ evento })`: donut de cobertura (texto central "X de Y", guion si `totalAsistentes === 0` → "0 / 0") y **barras horizontales apiladas** por checkpoint (`layout="vertical"` con nombres en el eje Y; `autoregistros` = `registros - manuales`, `manuales`, `stackId`, `ReferenceLine` en `totalAsistentes`), con `ResponsiveContainer` en altura fija/calculada (~44 px por barra), `isAnimationActive={false}` y scroll vertical (`max-h-[340px] overflow-y-auto`) cuando la lista es larga; sin barras si el evento no tiene checkpoints. Verificar con `npx tsc --noEmit`
+- [x] 2.2 Montar `<GraficosEvento>` dentro de cada `<section>` de evento en `src/app/operador/panel-operador.tsx` (entre el `header` y la lista de tarjetas, sobre el `map` de `eventosVisibles` para heredar el filtro). Verificar con `npx tsc --noEmit` que tipa y que el panel renderiza sin filtro igual que hoy más los gráficos
+
+## 3. Verificación
+
+- [x] 3.1 Probar en dev con el Operador: el donut de "Día de sol" muestra "2 de 5" de cobertura (Peppo y Peppa registrados en Habitación 601); las barras muestran Habitación 601 con `registros = 2` (mismo valor que antes del change) y Almuerzo/Bus en 0; tras un registro manual de prueba en Habitación 601, `manuales` pasa a 1 (autoregistros sigue en 2) y el sondeo actualiza la barra sin recargar la página; restaurar el registro de prueba. Confirmar que con el filtro "60" solo se grafica Habitación 601, que la cobertura no cambia con el filtro, que "zzz" oculta la sección con sus gráficos y que vaciar el filtro restaura todo. Verificar el escalado con lista larga: insertar temporalmente 25 checkpoints más en el evento de prueba y confirmar que el gráfico hace scroll vertical (contenedor limitado a ~340 px con más barras) sin comprimir las barras ni chocar las etiquetas del eje Y, y que al eliminarlos el panel vuelve al estado inicial
+- [x] 3.2 Guardar contra regresiones: `GET /api/operador/dashboard` responde `200` con los campos previos intactos más `asistentesRegistrados` y `manuales` (y `401`/`403` sin sesión o con otro rol); los totales por checkpoint no cambian; `openspec validate --changes panel-operador-graficos --strict` pasa; el árbol de trabajo queda limpio de scripts temporales

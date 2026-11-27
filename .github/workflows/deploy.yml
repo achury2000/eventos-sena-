@@ -1,0 +1,86 @@
+# Entrega a producción: migraciones primero, despliegue después.
+#
+# Solo corre con push a `main` (design.md D1). Las migraciones van en un job
+# aparte del despliegue, y el despliegue `needs` a las migraciones: si una
+# migración falla, no se despliega (design.md D4).
+#
+# Los secretos los crea quien administra el repositorio:
+#   DATABASE_URL (producción), VERCEL_TOKEN, VERCEL_ORG_ID, VERCEL_PROJECT_ID
+# Mientras no existan, el job de migraciones se detiene en el primer paso
+# nombrando el que falta (design.md D5).
+name: Despliegue
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+# Dos merges seguidos no compiten por el mismo despliegue: el segundo cancela al
+# primero, y el despliegue termina siendo el del último commit de main.
+concurrency:
+  group: despliegue-produccion
+  cancel-in-progress: false
+
+jobs:
+  migraciones:
+    name: Migraciones
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+
+      # Falla rápido y de forma legible. Un despliegue que se cae después de
+      # migrar deja el esquema adelantado sin código nuevo, que es la peor forma
+      # de fallar (design.md D4, D5).
+      - name: Verificar secretos
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+          VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+          VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
+        run: |
+          node -e "
+            const requeridos = ['DATABASE_URL', 'VERCEL_TOKEN', 'VERCEL_ORG_ID', 'VERCEL_PROJECT_ID'];
+            const faltan = requeridos.filter((nombre) => !process.env[nombre]);
+            if (faltan.length > 0) {
+              console.error('::error::faltan estos secretos en el repositorio: ' + faltan.join(', '));
+              process.exit(1);
+            }
+            console.log('secretos verificados');
+          "
+
+      - run: npm ci
+      - run: npx prisma migrate deploy
+
+  despliegue:
+    name: Despliegue a Vercel
+    needs: migraciones
+    runs-on: ubuntu-latest
+    environment: production
+    env:
+      VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+      VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+      VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+
+      - name: Preparar el proyecto de Vercel
+        run: npx --yes vercel@latest pull --yes --environment=production --token="$VERCEL_TOKEN"
+
+      # Vercel compila con sus propias variables; aquí solo se le entrega el
+      # código ya revisado por el CI de pull requests.
+      - name: Construir
+        run: npx --yes vercel@latest build --token="$VERCEL_TOKEN"
+
+      - name: Desplegar
+        run: npx --yes vercel@latest deploy --prebuilt --prod --token="$VERCEL_TOKEN"

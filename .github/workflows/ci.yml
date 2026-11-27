@@ -1,0 +1,196 @@
+# Verificación automática de cada pull request.
+#
+# En cada PR (y en cada push a main) corre lint, tipos, pruebas de integración y
+# pruebas end-to-end. Ningún job de este workflow recibe secretos de producción:
+# todo corre contra servicios efímeros del runner (design.md D1, D5).
+name: Verificación
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+# El workflow solo lee el repositorio. Declararlo explícito evita depender de la
+# configuración por omisión del repositorio (design.md D1).
+permissions:
+  contents: read
+
+# Al subir una corrección se cancela la corrida anterior de esa misma rama.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verificacion:
+    name: Lint y tipos
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+      - run: npm ci
+      # El client de Prisma está gitignoreado (src/generated/prisma) y npm ci no
+      # lo genera; sin este paso tsc no resuelve @/generated/prisma/client.
+      - run: npm run db:generate
+      - run: npm run lint
+      # typegen genera los tipos globales de rutas (LayoutProps, PageProps) en
+      # .next/types sin hacer un build completo; tsc los necesita (docs de Next).
+      - run: npx next typegen
+      - run: npx tsc --noEmit
+
+  integracion:
+    name: Pruebas de integración
+    runs-on: ubuntu-latest
+    # El setup del harness dropea y recrea `bienestar_sena_test` conectándose a
+    # la base `postgres` del mismo servidor, así que este usuario es
+    # superusuario dentro del contenedor (design.md D2).
+    services:
+      db:
+        image: postgres:18.4
+        env:
+          POSTGRES_USER: ci
+          POSTGRES_PASSWORD: ci_password_de_prueba
+          POSTGRES_DB: bienestar_sena
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U ci -d bienestar_sena"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgresql://ci:ci_password_de_prueba@localhost:5432/bienestar_sena
+      TEST_DATABASE_URL: postgresql://ci:ci_password_de_prueba@localhost:5432/bienestar_sena_test
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+      - run: npm ci
+      - run: npm run db:generate
+      - name: Verificar que las bases son las del runner
+        run: |
+          node -e "
+            const permitidos = ['localhost', '127.0.0.1', 'db'];
+            const revisar = (nombre, sufijo) => {
+              const bruto = process.env[nombre];
+              if (!bruto) {
+                console.error('::error::falta ' + nombre);
+                process.exit(1);
+              }
+              const url = new URL(bruto);
+              if (!permitidos.includes(url.hostname)) {
+                console.error('::error::' + nombre + ' apunta a ' + url.hostname + ', fuera del runner. El CI se niega a conectarse.');
+                process.exit(1);
+              }
+              if (sufijo && !url.pathname.endsWith(sufijo)) {
+                console.error('::error::' + nombre + ' debe apuntar a ' + sufijo);
+                process.exit(1);
+              }
+            };
+            revisar('DATABASE_URL');
+            revisar('TEST_DATABASE_URL', '/bienestar_sena_test');
+            console.log('bases del runner verificadas');
+          "
+      - run: npm test
+
+  e2e:
+    name: Pruebas end-to-end
+    runs-on: ubuntu-latest
+    services:
+      db:
+        image: postgres:18.4
+        env:
+          POSTGRES_USER: ci
+          POSTGRES_PASSWORD: ci_password_de_prueba
+          POSTGRES_DB: bienestar_sena
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U ci -d bienestar_sena"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgresql://ci:ci_password_de_prueba@localhost:5432/bienestar_sena
+      TEST_DATABASE_URL: postgresql://ci:ci_password_de_prueba@localhost:5432/bienestar_sena_test
+      # Credenciales de la corrida, no de producción: el CI nunca ve las reales.
+      S3_ENDPOINT: http://localhost:9000
+      S3_ACCESS_KEY: minioadmin
+      S3_SECRET_KEY: minioadmin
+      S3_BUCKET: firmas-digitales
+      S3_REGION: us-east-1
+      AUTH_SECRET: clave-de-prueba-solo-para-el-ci
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+      - run: npm ci
+      - run: npm run db:generate
+
+      # MinIO se levanta con `docker run` en vez de como service container
+      # porque el comando (`server /data`) no se puede declarar en un service
+      # container de GitHub Actions, y así el arranque es idéntico al de
+      # docker-compose.yml (design.md D3).
+      # Nota: quay.io/minio/minio y quay.io/minio/mc fueron eliminadas del
+      # registro; se usa la misma imagen mantenida (Chainguard) del compose.
+      - name: Levantar MinIO
+        run: |
+          docker run -d --name storage \
+            -p 9000:9000 \
+            -e MINIO_ROOT_USER=$S3_ACCESS_KEY \
+            -e MINIO_ROOT_PASSWORD=$S3_SECRET_KEY \
+            cgr.dev/chainguard/minio@sha256:e7ca559d9f7c0b5f24f5f669bb92f40f3ca88d56273b808bf3a7c116c17d2ffa \
+            server /data
+          for intento in $(seq 1 30); do
+            if curl -sf http://localhost:9000/minio/health/live > /dev/null; then
+              echo "MinIO listo"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "::error::MinIO no respondió en 60s"
+          docker logs storage
+          exit 1
+
+      # Se crea el bucket con el mismo SDK que usa la aplicación, para no
+      # depender de la imagen `mc` ni de descargar herramientas extra.
+      - name: Crear el bucket de firmas
+        run: |
+          node --input-type=module -e "
+            import { S3Client, CreateBucketCommand } from '@aws-sdk/client-s3';
+            const s3 = new S3Client({
+              endpoint: process.env.S3_ENDPOINT,
+              region: process.env.S3_REGION,
+              forcePathStyle: true,
+              credentials: {
+                accessKeyId: process.env.S3_ACCESS_KEY,
+                secretAccessKey: process.env.S3_SECRET_KEY,
+              },
+            });
+            try {
+              await s3.send(new CreateBucketCommand({ Bucket: process.env.S3_BUCKET }));
+              console.log('bucket ' + process.env.S3_BUCKET + ' listo');
+            } catch (error) {
+              console.error('::error::no se pudo crear el bucket', error);
+              process.exit(1);
+            }
+          "
+
+      - run: npx playwright install --with-deps chromium
+      - run: npm run test:e2e
+
+      - name: Guardar evidencia de la corrida
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: playwright-report
+          path: |
+            playwright-report/
+            test-results/
+          retention-days: 7

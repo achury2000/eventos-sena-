@@ -1,0 +1,339 @@
+// Ver /CONTEXT.md para el porqué de cada decisión de modelado.
+// No agregues codigoQr a Inscripcion/Asistente, ni un campo resultado a
+// RegistroControl, ni conviertas Asistente de vuelta en un simple contador
+// -- todas fueron decisiones deliberadas (ver CONTEXT.md, secciones 4, 5 y 7).
+
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// ---------------------------------------------------------------------------
+// Enums
+// ---------------------------------------------------------------------------
+
+enum RolUsuario {
+  ADMINISTRADOR
+  OPERADOR
+}
+
+enum TipoAfiliacion {
+  SENA
+  EXTERNO
+}
+
+enum EstadoEvento {
+  PLANEADO
+  INSCRIPCIONES_ABIERTAS
+  CERRADO
+  FINALIZADO
+  CANCELADO
+}
+
+// Categoría amplia, NO la lista específica de checkpoints (esa va en
+// Checkpoint.nombre, que es texto libre configurable por evento).
+enum TipoCheckpoint {
+  COMIDA
+  TRANSPORTE
+  ALOJAMIENTO
+  OTRO
+}
+
+enum EstadoInscripcion {
+  INSCRITO
+  CONFIRMADO
+  NO_ASISTIO
+  CANCELADO
+}
+
+enum MetodoRegistro {
+  AUTOREGISTRO
+  MANUAL
+}
+
+// NOTA: "resultado" (OK / YA_REGISTRADO / NO_ENCONTRADO /
+// CHECKPOINT_NO_ACTIVO) NO es un enum de este schema a propósito. Solo "OK"
+// puede llegar a persistirse como fila real (los otros tres casos se
+// rechazan antes de insertar, por la restricción única o por validación
+// previa) -- guardar ese campo sería redundante y engañoso. Ese tipo vive
+// como un tipo de TypeScript en la capa de API, tipando la respuesta HTTP
+// del Route Handler, no en la base de datos. Ver CONTEXT.md sección 7.
+
+// ---------------------------------------------------------------------------
+// Usuarios con cuenta -- SOLO Administrador y Operador.
+// Los asistentes (Aprendiz/Funcionario y sus acompañantes) NO tienen
+// registro aquí: sus datos viven en Asistente (ver más abajo, y CONTEXT.md
+// sección 4, "Sin cuenta de usuario para Aprendices/Funcionarios").
+// ---------------------------------------------------------------------------
+
+model Usuario {
+  id                String           @id @default(uuid())
+  nombreCompleto    String
+  documento         String           @unique
+  email             String           @unique
+  passwordHash      String
+  // Cuenta con contraseña temporal repartida por el Administrador (sin correo,
+  // ver openspec plataforma/gestion-claves): mientras esté activa, el usuario
+  // inicia sesión pero no ve su panel hasta definir la contraseña propia.
+  debeCambiarClave  Boolean          @default(false)
+  rol               RolUsuario
+  tipoAfiliacion    TipoAfiliacion   @default(SENA)
+  // Centro de formación declarado como texto libre: el sistema no mantiene un
+  // catálogo ni valida que el nombre exista (ver change
+  // centro-formacion-texto-libre). Obligatorio solo para ADMINISTRADOR.
+  centroFormacion   String?
+  creadoEn          DateTime         @default(now())
+
+  eventosCreados      Evento[]          @relation("EventoCreador")
+  eventosSupervisados EventoOperador[]
+  registrosAsistidos  RegistroControl[]
+  checkpointsActivados Checkpoint[]     @relation("CheckpointActivadoPor")
+
+  @@map("usuarios")
+}
+
+// ---------------------------------------------------------------------------
+// Eventos
+// ---------------------------------------------------------------------------
+
+model Evento {
+  id                  String       @id @default(uuid())
+  nombre              String
+  descripcion         String?
+  lugar               String
+  fechaInicio         DateTime
+  fechaFin            DateTime
+  inscripcionApertura DateTime
+  inscripcionCierre   DateTime
+  // cupoMaximo/cuposOcupados representan PERSONAS totales (titulares +
+  // acompañantes), no trámites de inscripción. Ver CONTEXT.md sección 7
+  // para el patrón atómico correcto (incrementa por el total de personas
+  // de la inscripción, no siempre +1).
+  cupoMaximo   Int
+  cuposOcupados Int          @default(0)
+  // Máximo de ACOMPAÑANTES por inscripción (personas adicionales al titular).
+  // 0 significa "inscripción individual" y es un valor de configuración
+  // legítimo, no un centinela de "sin límite": ningún valor de este campo
+  // equivale a un límite ilimitado, y el mayor aceptado es 10. Ver CONTEXT.md
+  // y el design del change openspec max-acompanantes-por-evento (D3, D8).
+  maxAcompanantes Int       @default(3)
+  estado       EstadoEvento @default(PLANEADO)
+  incluyeHotel Boolean      @default(false)
+  incluyeBus   Boolean      @default(false)
+
+  creadoPorId String
+  creadoPor   Usuario @relation("EventoCreador", fields: [creadoPorId], references: [id])
+
+  operadores    EventoOperador[]
+  checkpoints   Checkpoint[]
+  inscripciones Inscripcion[]
+  asistentes    Asistente[]
+  habitaciones  Habitacion[]
+
+  creadoEn     DateTime @default(now())
+  // Cancelar un evento es SIEMPRE un UPDATE de estado a CANCELADO, nunca
+  // un DELETE (Inscripcion.evento usa onDelete: Restrict a propósito, para
+  // conservar historial/evidencia). Ver CONTEXT.md sección 4.
+  actualizadoEn DateTime @updatedAt
+
+  @@map("eventos")
+}
+
+// Relación M:N Evento <-> Usuario (Operador), explícita para poder
+// consultar fácilmente "eventos asignados a este Operador" desde el
+// middleware/route handler (ver CONTEXT.md sección 6).
+model EventoOperador {
+  eventoId   String
+  operadorId String
+
+  evento   Evento  @relation(fields: [eventoId], references: [id], onDelete: Cascade)
+  operador Usuario @relation(fields: [operadorId], references: [id], onDelete: Cascade)
+
+  @@id([eventoId, operadorId])
+  @@map("evento_operadores")
+}
+
+// ---------------------------------------------------------------------------
+// Checkpoints
+// ---------------------------------------------------------------------------
+
+model Checkpoint {
+  id       String         @id @default(uuid())
+  eventoId String
+  evento   Evento         @relation(fields: [eventoId], references: [id], onDelete: Cascade)
+  nombre   String
+  tipo     TipoCheckpoint
+  // Token fijo de estación -- uno por checkpoint, NO uno por asistente.
+  codigoQr String         @unique @default(uuid())
+  // Lo activa/desactiva el Operador el día del evento. Mitiga el riesgo de
+  // que el QR impreso sea usado fuera de la ventana real de atención.
+  activo        Boolean  @default(false)
+  activadoPorId String?
+  activadoPor   Usuario? @relation("CheckpointActivadoPor", fields: [activadoPorId], references: [id])
+
+  registros RegistroControl[]
+
+  // Un checkpoint puede estar respaldado por una habitación del evento (1:1
+  // opcional): el cuarto funciona como estación de control con QR propio y su
+  // checkpoint se auto-provisiona/elimina con el ciclo de vida de la
+  // habitación. Los checkpoints de habitación NO se gestionan manualmente.
+  habitacionId String?      @unique
+  habitacion   Habitacion?  @relation("CheckpointHabitacion", fields: [habitacionId], references: [id], onDelete: Cascade)
+
+  creadoEn      DateTime @default(now())
+  actualizadoEn DateTime @updatedAt
+
+  @@map("checkpoints")
+}
+
+// ---------------------------------------------------------------------------
+// Inscripciones -- el trámite/grupo, no la persona. La identidad de cada
+// persona (titular o acompañante) vive en Asistente. Sin cuenta de usuario
+// asociada (ver nota arriba).
+// ---------------------------------------------------------------------------
+
+model Inscripcion {
+  id       String @id @default(uuid())
+  eventoId String
+  evento   Evento @relation(fields: [eventoId], references: [id], onDelete: Restrict)
+
+  correo String?
+
+  // El titular firma UNA vez al inscribirse; esa firma cobija también a los
+  // acompañantes que declara (decisión de negocio, no técnica -- ver
+  // CONTEXT.md sección 4). Referencia al archivo en almacenamiento privado
+  // (Vercel Blob/S3), NUNCA la imagen en base64 en este campo.
+  firmaUrl String
+  estado   EstadoInscripcion @default(INSCRITO)
+
+  // Ley 1581 (Habeas Data) -- una sola casilla de consentimiento, cubre
+  // datos personales y biométricos (firma) de TODO el grupo (titular +
+  // acompañantes). Texto del aviso pendiente de jurídica SENA (ver
+  // CONTEXT.md sección 10).
+  aceptoTratamientoDatos     Boolean
+  fechaAceptacionTratamiento DateTime
+
+  fechaInscripcion DateTime @default(now())
+  actualizadoEn    DateTime @updatedAt
+
+  // El titular es el Asistente con esTitular = true de esta inscripción;
+  // los demás son sus acompañantes. Ver CONTEXT.md sección 5.
+  asistentes Asistente[]
+
+  @@map("inscripciones")
+}
+
+// ---------------------------------------------------------------------------
+// Asistente -- cada PERSONA física que va al evento, titular o acompañante,
+// con el mismo tratamiento: cada uno se busca por documento en los
+// checkpoints, cada uno cuenta contra el cupo del evento, cada uno puede
+// tener habitación asignada. No existe una entidad "Acompanante" separada
+// a propósito -- ver CONTEXT.md sección 4 sobre por qué se unificaron.
+// ---------------------------------------------------------------------------
+
+model Asistente {
+  id            String @id @default(uuid())
+  inscripcionId String
+  inscripcion   Inscripcion @relation(fields: [inscripcionId], references: [id], onDelete: Cascade)
+
+  // Denormalizado desde Inscripcion.eventoId a propósito: permite validar
+  // unicidad de documento por evento (@@unique más abajo) e indexar
+  // consultas de checkpoint sin tener que pasar por Inscripcion primero.
+  eventoId String
+  evento   Evento @relation(fields: [eventoId], references: [id], onDelete: Restrict)
+
+  nombreCompleto String
+  documento      String
+  // Opcional: un acompañante puede no ser aprendiz/funcionario del SENA
+  // (ej. un familiar) y solo el titular declara su centro. Texto libre, sin
+  // catálogo: el sistema no valida que el nombre exista.
+  centroFormacion String?
+
+  esTitular Boolean @default(false)
+
+  registrosControl RegistroControl[]
+  habitaciones     AsistenteHabitacion[]
+
+  creadoEn DateTime @default(now())
+
+  // Evita que la misma persona (por documento) quede registrada dos veces
+  // en el mismo evento, sea como titular o como acompañante de cualquier
+  // inscripción.
+  @@unique([eventoId, documento])
+  @@map("asistentes")
+}
+
+// ---------------------------------------------------------------------------
+// Registro de control -- núcleo operativo del sistema.
+// Restricción única en (asistenteId, checkpointId): SIEMPRE intentar
+// insertar y capturar el error de duplicado (P2002), nunca "verificar si
+// existe, luego insertar". Ver CONTEXT.md sección 7.
+// ---------------------------------------------------------------------------
+
+model RegistroControl {
+  id           String     @id @default(uuid())
+  asistenteId  String
+  asistente    Asistente  @relation(fields: [asistenteId], references: [id], onDelete: Cascade)
+  checkpointId String
+  checkpoint   Checkpoint @relation(fields: [checkpointId], references: [id], onDelete: Cascade)
+  // Opcional: solo se llena si el registro fue manual, asistido por el
+  // Operador (asistente sin celular o con fallas de conectividad).
+  operadorId String?
+  operador   Usuario? @relation(fields: [operadorId], references: [id])
+  metodo     MetodoRegistro
+  timestamp  DateTime @default(now())
+
+  @@unique([asistenteId, checkpointId])
+  // Necesario para el COUNT agrupado por checkpoint del dashboard del
+  // Operador (CONTEXT.md sección 6) -- el índice de la restricción única
+  // de arriba no sirve para esto porque asistenteId va primero (regla del
+  // prefijo izquierdo). Si el dashboard llega a filtrar por rango de
+  // tiempo, agregar @@index([checkpointId, timestamp]) en su lugar.
+  @@index([checkpointId])
+  @@map("registros_control")
+}
+
+// ---------------------------------------------------------------------------
+// Habitaciones -- solo aplica si Evento.incluyeHotel = true.
+// Asignación siempre MANUAL por el Administrador, nunca automática, y por
+// Asistente individual (una familia puede necesitar varias habitaciones).
+// ---------------------------------------------------------------------------
+
+model Habitacion {
+  id            String @id @default(uuid())
+  eventoId      String
+  evento        Evento @relation(fields: [eventoId], references: [id], onDelete: Cascade)
+  // Texto libre que identifica el cuarto (ej. "101"). Único dentro del evento
+  // para evitar dos cuartos con el mismo identificador.
+  identificador String
+  // Personas que caben jugando según las camas del cuarto. La ocupación real
+  // se obtiene con _count.asistentes; no se denormaliza un campo "ocupados".
+  capacidad Int
+  // Token fijo de estación del cuarto: su QR codifica /checkpoint/{codigoQr}
+  // del checkpoint de esa habitación (1:1 con Checkpoint.habitacionId).
+  codigoQr String @unique @default(uuid())
+
+  asistentes AsistenteHabitacion[]
+
+  // Checkpoint que representa a esta habitación como estación de control del
+  // evento (tipo ALOJAMIENTO, activo). Se auto-provisiona con el cuarto.
+  checkpoint Checkpoint? @relation("CheckpointHabitacion")
+
+  @@unique([eventoId, identificador])
+  @@map("habitaciones")
+}
+
+model AsistenteHabitacion {
+  asistenteId  String
+  habitacionId String
+
+  asistente  Asistente  @relation(fields: [asistenteId], references: [id], onDelete: Cascade)
+  habitacion Habitacion @relation(fields: [habitacionId], references: [id], onDelete: Cascade)
+
+  @@id([asistenteId, habitacionId])
+  @@map("asistente_habitaciones")
+}

@@ -1,0 +1,27 @@
+node_modules
+.next
+.git
+.env
+.env.local
+npm-debug.log
+Dockerfile
+docker-compose.yml
+scripts
+*.md
+
+# Añadidos
+src/generated/prisma
+coverage
+.vscode
+.idea
+.DS_Store
+*.tsbuildinfo
+next-env.d.ts
+.claude
+.agents
+.windsurf
+.agent
+.cursor
+.gemini
+.opencode
+openspec/

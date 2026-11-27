@@ -1,0 +1,124 @@
+name: plataforma-bienestar-sena
+services:
+  db:
+    image: postgres:18.4
+    container_name: bienestar_sena_db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-sena}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-sena_dev}
+      POSTGRES_DB: ${POSTGRES_DB:-bienestar_sena}
+    ports:
+      - "5432:5432"
+    volumes:
+      - db_data:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-sena} -d ${POSTGRES_DB:-bienestar_sena}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  storage:
+    # Antes: quay.io/minio/minio:RELEASE.2024-10-13T13-34-11Z (tag eliminado del registro).
+    # cgr.dev/chainguard/minio es la imagen mantenida de MinIO (multi-arch). Digest
+    # fijado para builds reproducibles; equivale a :latest al 2026-10-06.
+    image: cgr.dev/chainguard/minio@sha256:e7ca559d9f7c0b5f24f5f669bb92f40f3ca88d56273b808bf3a7c116c17d2ffa
+    container_name: bienestar_sena_storage
+    restart: unless-stopped
+    # Corre como root: la imagen Chainguard usa un usuario no-root por defecto y no
+    # puede escribir en /data si el volumen fue creado por el MinIO anterior (root).
+    # Mantiene el mismo comportamiento que la imagen oficial; para un volumen nuevo
+    # también funciona.
+    user: "0"
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${S3_ACCESS_KEY:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${S3_SECRET_KEY:-minioadmin}
+    ports:
+      - "9000:9000"   # API S3
+      - "9001:9001"   # Consola web
+    volumes:
+      - storage_data:/data
+    healthcheck:
+      # La imagen no trae curl; se sondea con su propio cliente mc (corre como
+      # usuario no-root, con HOME escribible).
+      test: ["CMD-SHELL", "mc alias set local http://localhost:9000 $$MINIO_ROOT_USER $$MINIO_ROOT_PASSWORD >/dev/null 2>&1 && mc ready local"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  storage-init:                                          
+    # Usa la misma imagen de storage (incluye mc y sh). La imagen
+    # quay.io/minio/mc:latest fue eliminada del registro.
+    image: cgr.dev/chainguard/minio@sha256:e7ca559d9f7c0b5f24f5f669bb92f40f3ca88d56273b808bf3a7c116c17d2ffa
+    container_name: bienestar_sena_storage_init
+    depends_on:
+      storage:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >
+        mc alias set local http://storage:9000 "$${S3_ACCESS_KEY:-minioadmin}" "$${S3_SECRET_KEY:-minioadmin}" &&
+        mc mb --ignore-existing "local/$${S3_BUCKET:-firmas-digitales}" &&
+        echo "Bucket listo"
+    environment:
+      S3_ACCESS_KEY: ${S3_ACCESS_KEY:-minioadmin}
+      S3_SECRET_KEY: ${S3_SECRET_KEY:-minioadmin}
+      S3_BUCKET: ${S3_BUCKET:-firmas-digitales}
+    restart: "no"
+
+  # Aplica migraciones y datos iniciales sobre la base. Se ejecuta una vez por
+  # despliegue y termina; la app espera a que complete antes de arrancar.
+  migrate:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: migrator
+    container_name: bienestar_sena_migrate
+    restart: "no"
+    profiles: ["full"]
+    # Requiere un .env en la raíz (copiado de .env.example) para SEED_*.
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-sena}:${POSTGRES_PASSWORD:-sena_dev}@db:5432/${POSTGRES_DB:-bienestar_sena}
+    depends_on:
+      db:
+        condition: service_healthy
+
+  # Solo se levanta cuando se activa explícitamente el profile "full":
+  #   docker compose --profile full up --build
+  # En desarrollo normal (docker compose up -d db storage) este servicio no se toca.
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: runner
+    container_name: bienestar_sena_app
+    restart: unless-stopped
+    profiles: ["full"]
+    # Carga la config de la app (AUTH_SECRET, S3_*, NEXT_PUBLIC_URL, ...).
+    # Requiere un .env en la raíz (copiado de .env.example).
+    env_file:
+      - .env
+    environment:
+      # Dentro de la red de Docker, la app usa los nombres de servicio (db, storage),
+      # no localhost -- por eso estas dos variables se sobreescriben aquí.
+      DATABASE_URL: postgresql://${POSTGRES_USER:-sena}:${POSTGRES_PASSWORD:-sena_dev}@db:5432/${POSTGRES_DB:-bienestar_sena}
+      S3_ENDPOINT: http://storage:9000
+    ports:
+      - "3000:3000"
+    depends_on:
+      db:
+        condition: service_healthy
+      storage:
+        condition: service_healthy
+      storage-init:
+        condition: service_completed_successfully
+      migrate:
+        condition: service_completed_successfully
+
+volumes:
+  db_data:
+  storage_data:
